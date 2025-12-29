@@ -52,7 +52,7 @@ def add_stt_args(parser: argparse.ArgumentParser) -> None:
         help="Endpoint type: 'transcriptions' for /v1/audio/transcriptions, 'chat' for /v1/chat/completions",
     )
     parser.add_argument(
-        "--prompt", type=str, default=None, help="Optional prompt for transcription"
+        "--prompt", type=str, default="Transcribe the given audio in appropriate language.", help="Optional prompt for transcription"
     )
 
 

@@ -79,7 +79,6 @@ class AudioSTTBenchmark:
             kwargs = {
                 "file": file,
                 "model": self.model,
-                "response_format": "text",
                 "stream": True,
             }
 
@@ -89,16 +88,40 @@ class AudioSTTBenchmark:
             stream = await self.client.audio.transcriptions.create(**kwargs)
 
             async for chunk in stream:
-                if not first_token_received:
-                    ttft = (time.perf_counter() - start_time) * 1000
-                    first_token_received = True
+                # Transcription stream uses choices[].delta.content format (like chat)
+                chunk_text = None
 
-                if hasattr(chunk, "text"):
-                    collected_text += chunk.text
-                elif isinstance(chunk, str):
-                    collected_text += chunk
+                if hasattr(chunk, "choices") and chunk.choices:
+                    choice = chunk.choices[0]
+                    # choices can be dict or object
+                    if isinstance(choice, dict):
+                        delta = choice.get("delta", {})
+                        chunk_text = (
+                            delta.get("content") if isinstance(delta, dict) else None
+                        )
+                    elif hasattr(choice, "delta") and choice.delta:
+                        chunk_text = getattr(choice.delta, "content", None)
+
+                # Fallback for other formats
+                if not chunk_text:
+                    if hasattr(chunk, "text") and chunk.text:
+                        chunk_text = chunk.text
+                    elif hasattr(chunk, "delta") and chunk.delta:
+                        chunk_text = chunk.delta
+                    elif isinstance(chunk, str):
+                        chunk_text = chunk
+
+                if chunk_text:
+                    if not first_token_received:
+                        ttft = (time.perf_counter() - start_time) * 1000
+                        first_token_received = True
+                    collected_text += chunk_text
 
             end_time = time.perf_counter()
+
+            # If streaming returned no text, the stream object might have final text
+            if not collected_text and hasattr(stream, "text"):
+                collected_text = stream.text
 
             if not first_token_received:
                 ttft = (end_time - start_time) * 1000
