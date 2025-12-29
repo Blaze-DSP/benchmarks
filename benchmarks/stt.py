@@ -261,11 +261,16 @@ class AudioSTTBenchmark:
         ramp_start: int = 0,
         ramp_step: int = 0,
     ) -> BenchmarkStats:
-        """Run the benchmark with specified concurrency."""
+        """Run the benchmark with request-level concurrency control.
+
+        Maintains exact concurrency at the request level. New requests start
+        immediately as previous ones complete. Ramp-up increases concurrency
+        after batches of requests complete.
+        """
         self.results = []
-        completed = 0
         benchmark_start = time.perf_counter()
 
+        # Pre-generate sample indices for reproducibility
         sample_indices = [
             random.randint(0, len(audio_samples) - 1) for _ in range(total_requests)
         ]
@@ -275,65 +280,87 @@ class AudioSTTBenchmark:
         if use_ramp_up:
             print(
                 f"\nRunning benchmark: {total_requests} requests"
-                f"\n  Ramp-up: {ramp_start} -> {max_concurrent} (step: {ramp_step})"
+                f"\n  Ramp-up: {ramp_start} -> {max_concurrent} concurrent requests (step: {ramp_step})"
             )
         else:
             print(
                 f"\nRunning benchmark: {total_requests} requests, "
-                f"max {max_concurrent} concurrent"
+                f"max {max_concurrent} concurrent requests"
             )
 
-        async def bounded_request(
-            idx: int, semaphore: asyncio.Semaphore
-        ) -> STTRequestResult:
-            nonlocal completed
+        # Concurrency tracking
+        current_concurrency = ramp_start if use_ramp_up else max_concurrent
+        completed_requests = 0
+        requests_at_last_ramp = 0
 
-            async with semaphore:
-                audio = audio_samples[sample_indices[idx]]
-                result = await self._make_request(audio, str(uuid.uuid4())[:8])
+        # Queue of pending requests (index, audio_bytes, request_id)
+        pending_requests = [
+            (i, audio_samples[sample_indices[i]], str(uuid.uuid4())[:8])
+            for i in range(total_requests)
+        ]
+        active_tasks = {}  # task -> request_index mapping
 
-                completed += 1
-                if completed % 10 == 0 or completed == total_requests:
+        # Start initial batch of requests
+        for _ in range(min(current_concurrency, len(pending_requests))):
+            idx, audio, req_id = pending_requests.pop(0)
+            task = asyncio.create_task(self._make_request(audio, req_id))
+            active_tasks[task] = idx
+
+        # Process requests as they complete
+        while active_tasks:
+            done, pending = await asyncio.wait(
+                active_tasks.keys(), return_when=asyncio.FIRST_COMPLETED
+            )
+
+            for task in done:
+                result = await task
+                self.results.append(result)
+                completed_requests += 1
+
+                # Progress reporting
+                if completed_requests % 10 == 0 or completed_requests == total_requests:
                     elapsed = time.perf_counter() - benchmark_start
-                    rps = completed / elapsed if elapsed > 0 else 0
-                    print(f"  Progress: {completed}/{total_requests} ({rps:.1f} req/s)")
-
-                return result
-
-        if use_ramp_up:
-            current_concurrency = ramp_start
-            request_idx = 0
-            all_results = []
-
-            while request_idx < total_requests:
-                remaining = total_requests - request_idx
-                batch_size = min(current_concurrency, remaining)
-
-                semaphore = asyncio.Semaphore(current_concurrency)
-                print(f"  Running batch at concurrency {current_concurrency}...")
-
-                tasks = [
-                    bounded_request(request_idx + i, semaphore)
-                    for i in range(batch_size)
-                ]
-                batch_results = await asyncio.gather(*tasks)
-                all_results.extend(batch_results)
-
-                request_idx += batch_size
-
-                if current_concurrency < max_concurrent:
-                    current_concurrency = min(
-                        current_concurrency + ramp_step, max_concurrent
+                    rps = completed_requests / elapsed if elapsed > 0 else 0
+                    print(
+                        f"  Progress: {completed_requests}/{total_requests} "
+                        f"({rps:.1f} req/s, concurrency: {current_concurrency})"
                     )
 
-            self.results = all_results
-        else:
-            semaphore = asyncio.Semaphore(max_concurrent)
-            tasks = [bounded_request(i, semaphore) for i in range(total_requests)]
-            self.results = await asyncio.gather(*tasks)
+                # Remove completed task
+                del active_tasks[task]
+
+                # Start new request if available
+                if pending_requests:
+                    idx, audio, req_id = pending_requests.pop(0)
+                    new_task = asyncio.create_task(self._make_request(audio, req_id))
+                    active_tasks[new_task] = idx
+
+                # Ramp-up logic: increase concurrency after batch completes
+                if use_ramp_up and current_concurrency < max_concurrent:
+                    requests_since_ramp = completed_requests - requests_at_last_ramp
+
+                    # Trigger ramp-up after current_concurrency requests complete
+                    if requests_since_ramp >= current_concurrency:
+                        old_concurrency = current_concurrency
+                        current_concurrency = min(
+                            current_concurrency + ramp_step, max_concurrent
+                        )
+                        requests_at_last_ramp = completed_requests
+
+                        print(
+                            f"  Ramping up: {old_concurrency} -> {current_concurrency} concurrent requests"
+                        )
+
+                        # Start additional requests
+                        requests_to_add = current_concurrency - old_concurrency
+                        for _ in range(min(requests_to_add, len(pending_requests))):
+                            idx, audio, req_id = pending_requests.pop(0)
+                            new_task = asyncio.create_task(
+                                self._make_request(audio, req_id)
+                            )
+                            active_tasks[new_task] = idx
 
         total_time = time.perf_counter() - benchmark_start
-
         return BenchmarkStats.compute(self.results, total_time)
 
 

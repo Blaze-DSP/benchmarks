@@ -40,6 +40,78 @@ class TurnResult(BaseModel):
     response: Optional[str] = None
 
 
+class ConversationState(BaseModel):
+    """State tracker for an ongoing multi-turn conversation."""
+
+    conversation_id: str
+    messages: list[dict]  # Original conversation messages
+    turns: list[dict] = Field(
+        default_factory=list
+    )  # Parsed turns: {"assistant": msg, "users": [msgs]}
+    current_turn_index: int = 0
+    system_msg: Optional[dict] = None
+    context: list[dict] = Field(
+        default_factory=list
+    )  # Accumulated context for next turn
+    results: list[TurnResult] = Field(default_factory=list)
+
+    def has_more_turns(self) -> bool:
+        """Check if conversation has remaining turns to process."""
+        return self.current_turn_index < len(self.turns)
+
+    def get_next_turn(self) -> Optional[dict]:
+        """Get the next turn to process."""
+        if self.has_more_turns():
+            return self.turns[self.current_turn_index]
+        return None
+
+    def advance_turn(self, result: TurnResult) -> None:
+        """Add result and advance to next turn."""
+        self.results.append(result)
+
+        # Add current turn to context
+        current_turn = self.turns[self.current_turn_index]
+        self.context.append(current_turn["assistant"])
+        self.context.extend(current_turn["users"])
+
+        # Add model's response to context
+        if result.success and result.response:
+            self.context.append({"role": "assistant", "content": result.response})
+
+        self.current_turn_index += 1
+
+    @classmethod
+    def from_conversation(
+        cls, conversation: list[dict], conversation_id: str
+    ) -> "ConversationState":
+        """Initialize state from a conversation."""
+        system_msg = None
+        turns = []
+        current_turn = None
+
+        # Extract system message and group into turns
+        for msg in conversation:
+            role = msg.get("role")
+            if role == "system":
+                system_msg = msg
+            elif role == "assistant":
+                if current_turn and current_turn["users"]:
+                    turns.append(current_turn)
+                current_turn = {"assistant": msg, "users": []}
+            elif role == "user" and current_turn:
+                current_turn["users"].append(msg)
+
+        if current_turn and current_turn["users"]:
+            turns.append(current_turn)
+
+        return cls(
+            conversation_id=conversation_id,
+            messages=conversation,
+            turns=turns,
+            system_msg=system_msg,
+        )
+
+
 class LLMSummaryStats(BaseModel):
     """LLM summary statistics."""
 
@@ -299,6 +371,39 @@ class LLMBenchmark:
                 error=str(e),
             )
 
+    async def _process_single_turn_no_semaphore(
+        self, conv_state: ConversationState
+    ) -> ConversationState:
+        """Process a single turn from a conversation.
+
+        No semaphore needed - concurrency is controlled by number of active conversations.
+        """
+        turn = conv_state.get_next_turn()
+        if not turn:
+            return conv_state
+
+        # Build messages: system + context + current turn
+        messages = []
+        if conv_state.system_msg:
+            messages.append(conv_state.system_msg)
+        messages.extend(conv_state.context)
+        messages.append(turn["assistant"])
+        messages.extend(turn["users"])
+
+        # Make request
+        request_id = f"{conv_state.conversation_id}-t{conv_state.current_turn_index}"
+        result = await self._stream_request(
+            messages=messages,
+            request_id=request_id,
+            conversation_id=conv_state.conversation_id,
+            turn_index=conv_state.current_turn_index,
+        )
+
+        # Update state
+        conv_state.advance_turn(result)
+
+        return conv_state
+
     async def run_conversation(
         self, conversation: list[dict], conversation_id: str
     ) -> list[TurnResult]:
@@ -418,12 +523,16 @@ class LLMBenchmark:
         ramp_start: int = 0,
         ramp_step: int = 0,
     ) -> LLMBenchmarkStats:
-        """Run the benchmark with specified concurrency."""
+        """Run the benchmark with request-level concurrency control.
+
+        Concurrency level = number of active conversations (simulating concurrent users).
+        Each conversation processes turns sequentially (realistic user behavior).
+        New conversations start only when previous ones complete all turns.
+        """
         self.results = []
-        completed_convs = 0
-        total_convs = len(conversations)
         benchmark_start = time.perf_counter()
 
+        total_convs = len(conversations)
         total_turns = sum(count_turns(conv) for conv in conversations)
 
         use_ramp_up = ramp_start > 0 and ramp_step > 0 and ramp_start < max_concurrent
@@ -432,74 +541,116 @@ class LLMBenchmark:
         print(f"  Conversations: {total_convs}")
         print(f"  Total turns: {total_turns}")
         if use_ramp_up:
-            print(f"  Ramp-up: {ramp_start} -> {max_concurrent} (step: {ramp_step})")
+            print(
+                f"  Ramp-up: {ramp_start} -> {max_concurrent} conversations (step: {ramp_step})"
+            )
         else:
-            print(f"  Max concurrent: {max_concurrent}")
+            print(f"  Max concurrent conversations: {max_concurrent}")
 
-        async def run_conv_with_progress(
-            conv: list[dict], conv_id: str, semaphore: asyncio.Semaphore
-        ) -> list[TurnResult]:
-            nonlocal completed_convs
+        # Initialize conversation states
+        pending_convs = [
+            ConversationState.from_conversation(conv, str(uuid.uuid4())[:8])
+            for conv in conversations
+        ]
 
-            async with semaphore:
-                results = await self.run_conversation(conv, conv_id)
-                completed_convs += 1
+        # Concurrency tracking
+        current_concurrency = ramp_start if use_ramp_up else max_concurrent
+        completed_requests = 0
+        completed_convs = 0
 
-                if completed_convs % 5 == 0 or completed_convs == total_convs:
+        # Start initial batch of conversations
+        initial_count = min(current_concurrency, len(pending_convs))
+        active_conv_tasks = {}  # task -> ConversationState mapping
+
+        for _ in range(initial_count):
+            conv_state = pending_convs.pop(0)
+            task = asyncio.create_task(
+                self._process_single_turn_no_semaphore(conv_state)
+            )
+            active_conv_tasks[task] = conv_state
+
+        # Track when to ramp up (after batch of requests complete)
+        requests_at_last_ramp = 0
+
+        # Store all completed conversation states to collect results later
+        all_completed_convs = []
+
+        # Process conversations as requests complete
+        while active_conv_tasks:
+            done, pending = await asyncio.wait(
+                active_conv_tasks.keys(), return_when=asyncio.FIRST_COMPLETED
+            )
+
+            for task in done:
+                conv_state = await task
+                completed_requests += 1
+
+                # Progress reporting
+                if completed_requests % 10 == 0 or completed_requests == total_turns:
                     elapsed = time.perf_counter() - benchmark_start
                     print(
-                        f"  Progress: {completed_convs}/{total_convs} conversations "
+                        f"  Progress: {completed_requests}/{total_turns} requests, "
+                        f"{completed_convs}/{total_convs} conversations, "
+                        f"{len(active_conv_tasks)}/{current_concurrency} active "
                         f"({elapsed:.1f}s)"
                     )
 
-                return results
+                # Remove completed task
+                del active_conv_tasks[task]
 
-        if use_ramp_up:
-            current_concurrency = ramp_start
-            conv_idx = 0
-            all_results = []
-
-            while conv_idx < total_convs:
-                remaining = total_convs - conv_idx
-                batch_size = min(current_concurrency, remaining)
-
-                semaphore = asyncio.Semaphore(current_concurrency)
-                print(f"  Running batch at concurrency {current_concurrency}...")
-
-                tasks = [
-                    run_conv_with_progress(
-                        conversations[conv_idx + i],
-                        str(uuid.uuid4())[:8],
-                        semaphore,
+                # Check if conversation has more turns
+                if conv_state.has_more_turns():
+                    # Schedule next turn from SAME conversation (same user continues)
+                    new_task = asyncio.create_task(
+                        self._process_single_turn_no_semaphore(conv_state)
                     )
-                    for i in range(batch_size)
-                ]
-                batch_results = await asyncio.gather(*tasks)
+                    active_conv_tasks[new_task] = conv_state
+                else:
+                    # Conversation fully complete
+                    completed_convs += 1
+                    all_completed_convs.append(conv_state)
 
-                for conv_results in batch_results:
-                    all_results.extend(conv_results)
+                    # Replace with a new conversation if available
+                    if pending_convs:
+                        new_conv = pending_convs.pop(0)
+                        new_task = asyncio.create_task(
+                            self._process_single_turn_no_semaphore(new_conv)
+                        )
+                        active_conv_tasks[new_task] = new_conv
 
-                conv_idx += batch_size
+                # Ramp-up logic: increase active conversations after batch completes
+                if use_ramp_up and current_concurrency < max_concurrent:
+                    # Ramp up after processing a batch of requests (one full round)
+                    requests_since_ramp = completed_requests - requests_at_last_ramp
 
-                if current_concurrency < max_concurrent:
-                    current_concurrency = min(
-                        current_concurrency + ramp_step, max_concurrent
-                    )
+                    # Trigger ramp-up after current_concurrency requests complete
+                    # (meaning each active conversation completed one request)
+                    if requests_since_ramp >= current_concurrency:
+                        old_concurrency = current_concurrency
+                        current_concurrency = min(
+                            current_concurrency + ramp_step, max_concurrent
+                        )
 
-            self.results = all_results
-        else:
-            semaphore = asyncio.Semaphore(max_concurrent)
-            tasks = [
-                run_conv_with_progress(conv, str(uuid.uuid4())[:8], semaphore)
-                for conv in conversations
-            ]
-            results_nested = await asyncio.gather(*tasks)
+                        conversations_to_add = current_concurrency - old_concurrency
+                        requests_at_last_ramp = completed_requests
 
-            for conv_results in results_nested:
-                self.results.extend(conv_results)
+                        print(
+                            f"  Ramping up: {old_concurrency} -> {current_concurrency} conversations"
+                        )
+
+                        # Start additional conversations
+                        for _ in range(min(conversations_to_add, len(pending_convs))):
+                            new_conv = pending_convs.pop(0)
+                            new_task = asyncio.create_task(
+                                self._process_single_turn_no_semaphore(new_conv)
+                            )
+                            active_conv_tasks[new_task] = new_conv
+
+        # Collect all results from all conversation states
+        for conv_state in all_completed_convs:
+            self.results.extend(conv_state.results)
 
         total_time = time.perf_counter() - benchmark_start
-
         return self._compute_stats(total_time, total_convs)
 
     def _compute_stats(

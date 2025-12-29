@@ -20,4 +20,3 @@ __all__ = [
     "print_header",
     "print_footer",
 ]
-
