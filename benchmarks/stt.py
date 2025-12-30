@@ -123,8 +123,7 @@ class AudioSTTBenchmark:
             if not collected_text and hasattr(stream, "text"):
                 collected_text = stream.text
 
-            if not first_token_received:
-                ttft = (end_time - start_time) * 1000
+            # TTFT remains 0 if no tokens received (no meaningful "first token" time)
 
             return STTRequestResult(
                 request_id=request_id,
@@ -197,8 +196,7 @@ class AudioSTTBenchmark:
 
             end_time = time.perf_counter()
 
-            if not first_token_received:
-                ttft = (end_time - start_time) * 1000
+            # TTFT remains 0 if no tokens received (no meaningful "first token" time)
 
             return STTRequestResult(
                 request_id=request_id,

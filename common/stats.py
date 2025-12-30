@@ -1,9 +1,34 @@
 """Benchmark statistics models and computation utilities."""
 
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 from pydantic import BaseModel, Field
+
+
+def compute_tpot_array(
+    results: list,
+    get_output_tokens: Callable = lambda r: r.output_tokens,
+    get_ttft: Callable = lambda r: r.ttft_ms,
+    get_latency: Callable = lambda r: r.latency_ms,
+) -> np.ndarray:
+    """Compute TPOT (Time Per Output Token) array from results.
+
+    TPOT measures the average time to generate each token after the first token.
+    Formula: (latency - ttft) / (output_tokens - 1)
+
+    Requires at least 2 output tokens to compute meaningful TPOT since the first
+    token's time is captured by TTFT.
+    """
+    tpots = []
+    for r in results:
+        output_tok = get_output_tokens(r)
+        ttft = get_ttft(r)
+        latency = get_latency(r)
+        if output_tok > 1 and ttft > 0:
+            generation_time = latency - ttft
+            tpots.append(generation_time / (output_tok - 1))
+    return np.array(tpots) if tpots else np.array([])
 
 
 class PercentileStats(BaseModel):
@@ -184,16 +209,9 @@ class BenchmarkStats:
 
         latencies = np.array([get_latency(r) for r in successful])
         ttfts = np.array([get_ttft(r) for r in successful if get_ttft(r) > 0])
-
-        tpots = []
-        for r in successful:
-            output_tok = get_output_tokens(r)
-            ttft = get_ttft(r)
-            latency = get_latency(r)
-            if output_tok > 0 and ttft > 0:
-                generation_time = latency - ttft
-                tpots.append(generation_time / output_tok)
-        tpots_arr = np.array(tpots) if tpots else np.array([])
+        tpots_arr = compute_tpot_array(
+            successful, get_output_tokens, get_ttft, get_latency
+        )
 
         return cls(
             total_requests=len(results),
@@ -271,4 +289,3 @@ class BenchmarkStats:
             print("\nErrors:")
             for error, count in sorted(self.errors.items(), key=lambda x: -x[1]):
                 print(f"  [{count}x] {error}")
-

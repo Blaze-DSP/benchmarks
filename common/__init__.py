@@ -7,6 +7,7 @@ from .stats import (
     SummaryStats,
     ThroughputStats,
     TokenStats,
+    compute_tpot_array,
 )
 from .utils import print_footer, print_header
 
@@ -17,6 +18,7 @@ __all__ = [
     "SummaryStats",
     "ThroughputStats",
     "TokenStats",
+    "compute_tpot_array",
     "print_header",
     "print_footer",
 ]

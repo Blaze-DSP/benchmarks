@@ -20,7 +20,13 @@ from datasets import load_dataset
 from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
 
-from ..common import PercentileStats, TokenStats, print_footer, print_header
+from ..common import (
+    PercentileStats,
+    TokenStats,
+    compute_tpot_array,
+    print_footer,
+    print_header,
+)
 
 
 class TurnResult(BaseModel):
@@ -340,8 +346,7 @@ class LLMBenchmark:
 
             end_time = time.perf_counter()
 
-            if not first_token_received:
-                ttft = (end_time - start_time) * 1000
+            # TTFT remains 0 if no tokens received (no meaningful "first token" time)
 
             return TurnResult(
                 request_id=request_id,
@@ -685,13 +690,7 @@ class LLMBenchmark:
 
         latencies = np.array([r.latency_ms for r in successful])
         ttfts = np.array([r.ttft_ms for r in successful if r.ttft_ms > 0])
-
-        tpots = []
-        for r in successful:
-            if r.output_tokens > 0 and r.ttft_ms > 0:
-                generation_time = r.latency_ms - r.ttft_ms
-                tpots.append(generation_time / r.output_tokens)
-        tpots_arr = np.array(tpots) if tpots else np.array([])
+        tpots_arr = compute_tpot_array(successful)
 
         return LLMBenchmarkStats(
             total_requests=len(self.results),
