@@ -2,8 +2,10 @@
 LLM Chat Completions Benchmark Implementation.
 
 Benchmarks /v1/chat/completions endpoint with multi-turn conversations.
-Each concurrent request processes a full conversation from the dataset,
-building up context turn by turn.
+Uses semaphore-based concurrency control with conversation chains to ensure:
+1. Exact concurrency is maintained at all times
+2. No two requests from the same conversation run concurrently
+3. Turns within a conversation execute sequentially
 """
 
 import asyncio
@@ -29,6 +31,19 @@ from ..common import (
 )
 
 
+# =============================================================================
+# Data Models
+# =============================================================================
+
+
+class PrebuiltRequest(BaseModel):
+    """A pre-built request with full context baked in."""
+
+    conversation_id: str
+    turn_index: int
+    messages: list[dict]  # Full context + current turn (pre-built)
+
+
 class TurnResult(BaseModel):
     """Result of a single turn in a conversation."""
 
@@ -44,78 +59,6 @@ class TurnResult(BaseModel):
     output_tokens: int = 0
     error: Optional[str] = None
     response: Optional[str] = None
-
-
-class ConversationState(BaseModel):
-    """State tracker for an ongoing multi-turn conversation."""
-
-    conversation_id: str
-    messages: list[dict]  # Original conversation messages
-    turns: list[dict] = Field(
-        default_factory=list
-    )  # Parsed turns: {"assistant": msg, "users": [msgs]}
-    current_turn_index: int = 0
-    system_msg: Optional[dict] = None
-    context: list[dict] = Field(
-        default_factory=list
-    )  # Accumulated context for next turn
-    results: list[TurnResult] = Field(default_factory=list)
-
-    def has_more_turns(self) -> bool:
-        """Check if conversation has remaining turns to process."""
-        return self.current_turn_index < len(self.turns)
-
-    def get_next_turn(self) -> Optional[dict]:
-        """Get the next turn to process."""
-        if self.has_more_turns():
-            return self.turns[self.current_turn_index]
-        return None
-
-    def advance_turn(self, result: TurnResult) -> None:
-        """Add result and advance to next turn."""
-        self.results.append(result)
-
-        # Add current turn to context
-        current_turn = self.turns[self.current_turn_index]
-        self.context.append(current_turn["assistant"])
-        self.context.extend(current_turn["users"])
-
-        # Add model's response to context
-        if result.success and result.response:
-            self.context.append({"role": "assistant", "content": result.response})
-
-        self.current_turn_index += 1
-
-    @classmethod
-    def from_conversation(
-        cls, conversation: list[dict], conversation_id: str
-    ) -> "ConversationState":
-        """Initialize state from a conversation."""
-        system_msg = None
-        turns = []
-        current_turn = None
-
-        # Extract system message and group into turns
-        for msg in conversation:
-            role = msg.get("role")
-            if role == "system":
-                system_msg = msg
-            elif role == "assistant":
-                if current_turn and current_turn["users"]:
-                    turns.append(current_turn)
-                current_turn = {"assistant": msg, "users": []}
-            elif role == "user" and current_turn:
-                current_turn["users"].append(msg)
-
-        if current_turn and current_turn["users"]:
-            turns.append(current_turn)
-
-        return cls(
-            conversation_id=conversation_id,
-            messages=conversation,
-            turns=turns,
-            system_msg=system_msg,
-        )
 
 
 class LLMSummaryStats(BaseModel):
@@ -202,6 +145,11 @@ class LLMBenchmarkStats:
         )
 
 
+# =============================================================================
+# Dataset Loading and Preprocessing
+# =============================================================================
+
+
 def load_and_prepare_dataset(dataset_name: str, split: str = "train") -> pd.DataFrame:
     """Load and prepare the conversation dataset."""
     print(f"Loading dataset: {dataset_name} (split: {split})")
@@ -233,7 +181,6 @@ def count_turns(conversation: list[dict]) -> int:
     for msg in conversation:
         role = msg.get("role")
         if role == "assistant":
-            # If we had a complete turn before this assistant, count it
             if has_assistant and has_users:
                 turn_count += 1
             has_assistant = True
@@ -241,56 +188,193 @@ def count_turns(conversation: list[dict]) -> int:
         elif role == "user" and has_assistant:
             has_users = True
 
-    # Count the last turn if complete
     if has_assistant and has_users:
         turn_count += 1
 
     return turn_count
 
 
-def truncate_conversation(conversation: list[dict], max_turns: int) -> list[dict]:
-    """Truncate a conversation to a maximum number of turns.
+def extract_turns(conversation: list[dict]) -> tuple[Optional[dict], list[dict]]:
+    """Extract system message and turns from a conversation.
 
-    A turn is one assistant message followed by one or more user messages.
-    Expected format: [system, assistant, user, user, ..., assistant, user, ...]
+    Returns:
+        Tuple of (system_message, list_of_turns)
+        where each turn is {"assistant": msg, "users": [msgs]}
     """
-    if max_turns <= 0:
-        return []
-
-    truncated = []
-    turn_count = 0
-    current_assistant = None
-    current_users = []
+    system_msg = None
+    turns = []
+    current_turn = None
 
     for msg in conversation:
         role = msg.get("role")
-
         if role == "system":
-            truncated.append(msg)
+            system_msg = msg
         elif role == "assistant":
-            # Save previous turn if complete
-            if current_assistant and current_users:
-                truncated.append(current_assistant)
-                truncated.extend(current_users)
-                turn_count += 1
-                if turn_count >= max_turns:
-                    break
-            # Start new turn
-            current_assistant = msg
-            current_users = []
-        elif role == "user" and current_assistant:
-            current_users.append(msg)
+            if current_turn and current_turn["users"]:
+                turns.append(current_turn)
+            current_turn = {"assistant": msg, "users": []}
+        elif role == "user" and current_turn:
+            current_turn["users"].append(msg)
 
-    # Add last turn if complete and under limit
-    if turn_count < max_turns and current_assistant and current_users:
-        truncated.append(current_assistant)
-        truncated.extend(current_users)
+    if current_turn and current_turn["users"]:
+        turns.append(current_turn)
 
-    return truncated
+    return system_msg, turns
+
+
+def build_prebuilt_requests(
+    conversation: list[dict],
+    conversation_id: str,
+    max_turns: int,
+) -> list[PrebuiltRequest]:
+    """Build pre-built requests for a conversation with full context baked in.
+
+    Context for turn N includes the original assistant content from turns 0..N-1
+    as simulated responses. This allows deterministic pre-building while maintaining
+    realistic context lengths.
+    """
+    system_msg, turns = extract_turns(conversation)
+
+    # Truncate to max_turns
+    turns = turns[:max_turns]
+
+    requests = []
+    context = []  # Accumulated context from previous turns
+
+    for turn_index, turn in enumerate(turns):
+        # Build messages: system + context + current turn
+        messages = []
+        if system_msg:
+            messages.append(system_msg)
+        messages.extend(context)
+        messages.append(turn["assistant"])
+        messages.extend(turn["users"])
+
+        requests.append(
+            PrebuiltRequest(
+                conversation_id=conversation_id,
+                turn_index=turn_index,
+                messages=messages,
+            )
+        )
+
+        # Add current turn to context for next turn
+        # Use the original assistant content as "simulated response"
+        context.append(turn["assistant"])
+        context.extend(turn["users"])
+        # Add assistant's content as the response (from dataset)
+        assistant_content = turn["assistant"].get("content", "")
+        if assistant_content:
+            context.append({"role": "assistant", "content": assistant_content})
+
+    return requests
+
+
+def prepare_benchmark_requests(
+    conversations: list[list[dict]],
+    max_turns: int,
+    max_concurrent: int,
+    num_conversations: Optional[int] = None,
+    total_requests: Optional[int] = None,
+    seed: int = 42,
+) -> tuple[list[list[PrebuiltRequest]], int, int]:
+    """Prepare all benchmark requests grouped by conversation.
+
+    Args:
+        conversations: List of raw conversations from dataset
+        max_turns: Maximum turns per conversation (all truncated to this)
+        max_concurrent: Maximum concurrent requests (for validation)
+        num_conversations: Target number of conversations (optional)
+        total_requests: Target total requests (optional, for validation)
+        seed: Random seed for shuffling
+
+    Returns:
+        Tuple of (grouped_requests, actual_num_conversations, actual_total_requests)
+        where grouped_requests[i] is a list of PrebuiltRequests for conversation i
+
+    Raises:
+        ValueError: If constraints cannot be satisfied
+    """
+    random.seed(seed)
+
+    # Filter conversations that have enough turns
+    valid_conversations = []
+    for conv in conversations:
+        if count_turns(conv) >= max_turns:
+            valid_conversations.append(conv)
+
+    if len(valid_conversations) == 0:
+        raise ValueError(
+            f"No conversations found with >= {max_turns} turns. "
+            f"Try lowering --max-turns."
+        )
+
+    print(f"Found {len(valid_conversations)} conversations with >= {max_turns} turns")
+
+    # Shuffle for randomness
+    random.shuffle(valid_conversations)
+
+    # Determine number of conversations to use
+    if num_conversations is not None:
+        if num_conversations > len(valid_conversations):
+            raise ValueError(
+                f"Requested {num_conversations} conversations but only "
+                f"{len(valid_conversations)} have >= {max_turns} turns. "
+                f"Try lowering --max-turns or --num-conversations."
+            )
+        selected_conversations = valid_conversations[:num_conversations]
+    else:
+        selected_conversations = valid_conversations
+
+    actual_num_convs = len(selected_conversations)
+    actual_total_requests = actual_num_convs * max_turns
+
+    # Validation
+    if actual_num_convs < max_concurrent:
+        raise ValueError(
+            f"Need at least {max_concurrent} conversations to maintain "
+            f"{max_concurrent} concurrency, but only have {actual_num_convs}. "
+            f"Try lowering --max-concurrent or --max-turns."
+        )
+
+    if total_requests is not None and actual_total_requests != total_requests:
+        raise ValueError(
+            f"--total-requests={total_requests} doesn't match computed total: "
+            f"{actual_num_convs} conversations × {max_turns} turns = {actual_total_requests}. "
+            f"Either adjust --num-conversations or remove --total-requests."
+        )
+
+    # Warn if ratio is low
+    recommended_convs = int(max_concurrent * 1.5)
+    if actual_num_convs < recommended_convs:
+        drop_point = (actual_num_convs - max_concurrent) * max_turns
+        sustained_pct = (drop_point / actual_total_requests) * 100 if actual_total_requests > 0 else 0
+        print(
+            f"⚠️  Warning: {actual_num_convs} conversations may not sustain "
+            f"{max_concurrent} concurrency until end.\n"
+            f"   Full concurrency sustained for ~{sustained_pct:.0f}% of requests.\n"
+            f"   Recommendation: Use >= {recommended_convs} conversations "
+            f"(--max-turns={actual_total_requests // recommended_convs} with "
+            f"--num-conversations={recommended_convs})."
+        )
+
+    # Build all requests
+    grouped_requests = []
+    for conv in selected_conversations:
+        conv_id = str(uuid.uuid4())[:8]
+        requests = build_prebuilt_requests(conv, conv_id, max_turns)
+        grouped_requests.append(requests)
+
+    return grouped_requests, actual_num_convs, actual_total_requests
+
+
+# =============================================================================
+# Benchmark Runner
+# =============================================================================
 
 
 class LLMBenchmark:
-    """Benchmark runner for LLM chat completions."""
+    """Benchmark runner for LLM chat completions with semaphore-based concurrency."""
 
     def __init__(
         self,
@@ -309,10 +393,7 @@ class LLMBenchmark:
 
     async def _stream_request(
         self,
-        messages: list[dict],
-        request_id: str,
-        conversation_id: str,
-        turn_index: int,
+        request: PrebuiltRequest,
     ) -> TurnResult:
         """Make a streaming request to measure TTFT and collect tokens."""
         start_time = time.perf_counter()
@@ -322,10 +403,12 @@ class LLMBenchmark:
         input_tokens = 0
         output_tokens = 0
 
+        request_id = f"{request.conversation_id}-t{request.turn_index}"
+
         try:
             stream = await self.client.chat.completions.create(
                 model=self.model,
-                messages=messages,
+                messages=request.messages,
                 max_tokens=self.max_tokens,
                 stream=True,
                 stream_options={"include_usage": True},
@@ -346,12 +429,10 @@ class LLMBenchmark:
 
             end_time = time.perf_counter()
 
-            # TTFT remains 0 if no tokens received (no meaningful "first token" time)
-
             return TurnResult(
                 request_id=request_id,
-                conversation_id=conversation_id,
-                turn_index=turn_index,
+                conversation_id=request.conversation_id,
+                turn_index=request.turn_index,
                 start_time=start_time,
                 end_time=end_time,
                 latency_ms=(end_time - start_time) * 1000,
@@ -366,8 +447,8 @@ class LLMBenchmark:
             end_time = time.perf_counter()
             return TurnResult(
                 request_id=request_id,
-                conversation_id=conversation_id,
-                turn_index=turn_index,
+                conversation_id=request.conversation_id,
+                turn_index=request.turn_index,
                 start_time=start_time,
                 end_time=end_time,
                 latency_ms=(end_time - start_time) * 1000,
@@ -376,104 +457,8 @@ class LLMBenchmark:
                 error=str(e),
             )
 
-    async def _process_single_turn_no_semaphore(
-        self, conv_state: ConversationState
-    ) -> ConversationState:
-        """Process a single turn from a conversation.
-
-        No semaphore needed - concurrency is controlled by number of active conversations.
-        """
-        turn = conv_state.get_next_turn()
-        if not turn:
-            return conv_state
-
-        # Build messages: system + context + current turn
-        messages = []
-        if conv_state.system_msg:
-            messages.append(conv_state.system_msg)
-        messages.extend(conv_state.context)
-        messages.append(turn["assistant"])
-        messages.extend(turn["users"])
-
-        # Make request
-        request_id = f"{conv_state.conversation_id}-t{conv_state.current_turn_index}"
-        result = await self._stream_request(
-            messages=messages,
-            request_id=request_id,
-            conversation_id=conv_state.conversation_id,
-            turn_index=conv_state.current_turn_index,
-        )
-
-        # Update state
-        conv_state.advance_turn(result)
-
-        return conv_state
-
-    async def run_conversation(
-        self, conversation: list[dict], conversation_id: str
-    ) -> list[TurnResult]:
-        """Run a full multi-turn conversation.
-
-        Expected format: [system, assistant, user, user, ..., assistant, user, ...]
-        Each turn is: one assistant message followed by one or more user messages.
-        Each request sends: system + context + current turn (assistant + users)
-        """
-        results = []
-        context = []
-
-        system_msg = None
-        turns = []  # List of {"assistant": msg, "users": [msg, ...]}
-
-        # Extract system message and group remaining into turns
-        current_turn = None
-        for msg in conversation:
-            role = msg.get("role")
-            if role == "system":
-                system_msg = msg
-            elif role == "assistant":
-                # Save previous turn if complete
-                if current_turn and current_turn["users"]:
-                    turns.append(current_turn)
-                # Start new turn
-                current_turn = {"assistant": msg, "users": []}
-            elif role == "user" and current_turn:
-                current_turn["users"].append(msg)
-
-        # Don't forget the last turn
-        if current_turn and current_turn["users"]:
-            turns.append(current_turn)
-
-        # Process each turn
-        for turn_index, turn in enumerate(turns):
-            # Build messages: system + context + assistant + all users
-            messages = []
-            if system_msg:
-                messages.append(system_msg)
-            messages.extend(context)
-            messages.append(turn["assistant"])
-            messages.extend(turn["users"])
-
-            request_id = f"{conversation_id}-t{turn_index}"
-            result = await self._stream_request(
-                messages=messages,
-                request_id=request_id,
-                conversation_id=conversation_id,
-                turn_index=turn_index,
-            )
-            results.append(result)
-
-            # Add current turn to context for next turn
-            context.append(turn["assistant"])
-            context.extend(turn["users"])
-
-            # Add model's response to context
-            if result.success and result.response:
-                context.append({"role": "assistant", "content": result.response})
-
-        return results
-
     async def warmup(
-        self, conversations: list[list[dict]], num_warmups: int = 3
+        self, grouped_requests: list[list[PrebuiltRequest]], num_warmups: int = 3
     ) -> None:
         """Run warmup requests (not counted in metrics)."""
         if num_warmups <= 0:
@@ -481,40 +466,12 @@ class LLMBenchmark:
 
         print(f"\nRunning {num_warmups} warmup requests...")
 
-        for i in range(num_warmups):
-            conv_idx = random.randint(0, len(conversations) - 1)
-            conv = conversations[conv_idx]
+        # Pick random first-turn requests for warmup
+        first_turn_requests = [chain[0] for chain in grouped_requests if chain]
 
-            # Build messages: system + first turn (assistant + users)
-            messages = []
-            first_assistant = None
-            first_users = []
-
-            for msg in conv:
-                role = msg.get("role")
-                if role == "system":
-                    messages.append(msg)
-                elif role == "assistant":
-                    if first_assistant is None:
-                        first_assistant = msg
-                    else:
-                        break  # Stop at second assistant
-                elif role == "user" and first_assistant:
-                    first_users.append(msg)
-
-            if first_assistant:
-                messages.append(first_assistant)
-            messages.extend(first_users)
-
-            if len(messages) < 2:
-                continue
-
-            result = await self._stream_request(
-                messages=messages,
-                request_id=f"warmup-{i}",
-                conversation_id=f"warmup-{i}",
-                turn_index=0,
-            )
+        for i in range(min(num_warmups, len(first_turn_requests))):
+            request = random.choice(first_turn_requests)
+            result = await self._stream_request(request)
             status = "✓" if result.success else "✗"
             print(
                 f"  Warmup {i + 1}/{num_warmups}: {status} "
@@ -523,137 +480,138 @@ class LLMBenchmark:
 
     async def run_benchmark(
         self,
-        conversations: list[list[dict]],
+        grouped_requests: list[list[PrebuiltRequest]],
         max_concurrent: int,
         ramp_start: int = 0,
         ramp_step: int = 0,
     ) -> LLMBenchmarkStats:
-        """Run the benchmark with request-level concurrency control.
+        """Run the benchmark with round-robin request scheduling.
 
-        Concurrency level = number of active conversations (simulating concurrent users).
-        Each conversation processes turns sequentially (realistic user behavior).
-        New conversations start only when previous ones complete all turns.
+        Uses a centralized queue to ensure requests are picked from different
+        conversations, maintaining even distribution and preventing any single
+        conversation from exhausting early.
+
+        Supports optional ramp-up from ramp_start to max_concurrent.
         """
         self.results = []
-        benchmark_start = time.perf_counter()
 
-        total_convs = len(conversations)
-        total_turns = sum(count_turns(conv) for conv in conversations)
+        total_convs = len(grouped_requests)
+        total_requests = sum(len(chain) for chain in grouped_requests)
 
         use_ramp_up = ramp_start > 0 and ramp_step > 0 and ramp_start < max_concurrent
 
         print(f"\nRunning benchmark:")
         print(f"  Conversations: {total_convs}")
-        print(f"  Total turns: {total_turns}")
+        print(f"  Total requests: {total_requests}")
+        print(f"  Max concurrent: {max_concurrent}")
+        print(f"  Turns per conversation: {total_requests // total_convs}")
         if use_ramp_up:
-            print(
-                f"  Ramp-up: {ramp_start} -> {max_concurrent} conversations (step: {ramp_step})"
-            )
-        else:
-            print(f"  Max concurrent conversations: {max_concurrent}")
+            print(f"  Ramp-up: {ramp_start} -> {max_concurrent} (step: {ramp_step})")
 
-        # Initialize conversation states
-        pending_convs = [
-            ConversationState.from_conversation(conv, str(uuid.uuid4())[:8])
-            for conv in conversations
-        ]
+        # Track state for each conversation
+        # conv_state[i] = next turn index to process for conversation i
+        conv_state = [0] * total_convs
+        conv_complete = [False] * total_convs
+        max_turns = len(grouped_requests[0]) if grouped_requests else 0
 
-        # Concurrency tracking
+        # Concurrency control
         current_concurrency = ramp_start if use_ramp_up else max_concurrent
         completed_requests = 0
         completed_convs = 0
-
-        # Start initial batch of conversations
-        initial_count = min(current_concurrency, len(pending_convs))
-        active_conv_tasks = {}  # task -> ConversationState mapping
-
-        for _ in range(initial_count):
-            conv_state = pending_convs.pop(0)
-            task = asyncio.create_task(
-                self._process_single_turn_no_semaphore(conv_state)
-            )
-            active_conv_tasks[task] = conv_state
-
-        # Track when to ramp up (after batch of requests complete)
         requests_at_last_ramp = 0
+        benchmark_start = time.perf_counter()
 
-        # Store all completed conversation states to collect results later
-        all_completed_convs = []
+        # Build initial request queue: round-robin across conversations
+        # Queue contains (conv_index, turn_index) pairs
+        request_queue = []
+        for turn_idx in range(max_turns):
+            for conv_idx in range(total_convs):
+                request_queue.append((conv_idx, turn_idx))
 
-        # Process conversations as requests complete
-        while active_conv_tasks:
-            done, pending = await asyncio.wait(
-                active_conv_tasks.keys(), return_when=asyncio.FIRST_COMPLETED
+        # Track which conversations have in-flight requests
+        conv_in_flight = [False] * total_convs
+        active_tasks = {}  # task -> (conv_idx, turn_idx)
+
+        def get_next_request():
+            """Get next request ensuring no two from same conversation run concurrently."""
+            for i, (conv_idx, turn_idx) in enumerate(request_queue):
+                # Skip if this conversation already has a request in flight
+                if conv_in_flight[conv_idx]:
+                    continue
+                # Skip if this turn isn't ready yet (previous turn not complete)
+                if turn_idx > conv_state[conv_idx]:
+                    continue
+                # Found a valid request
+                request_queue.pop(i)
+                return conv_idx, turn_idx
+            return None, None
+
+        # Start initial batch of requests
+        for _ in range(min(current_concurrency, len(request_queue))):
+            conv_idx, turn_idx = get_next_request()
+            if conv_idx is not None:
+                conv_in_flight[conv_idx] = True
+                request = grouped_requests[conv_idx][turn_idx]
+                task = asyncio.create_task(self._stream_request(request))
+                active_tasks[task] = (conv_idx, turn_idx)
+
+        # Process requests as they complete
+        while active_tasks:
+            done, _ = await asyncio.wait(
+                active_tasks.keys(), return_when=asyncio.FIRST_COMPLETED
             )
 
             for task in done:
-                conv_state = await task
+                result = await task
+                self.results.append(result)
                 completed_requests += 1
 
-                # Progress reporting
-                if completed_requests % 10 == 0 or completed_requests == total_turns:
-                    elapsed = time.perf_counter() - benchmark_start
-                    print(
-                        f"  Progress: {completed_requests}/{total_turns} requests, "
-                        f"{completed_convs}/{total_convs} conversations, "
-                        f"{len(active_conv_tasks)}/{current_concurrency} active "
-                        f"({elapsed:.1f}s)"
-                    )
+                conv_idx, turn_idx = active_tasks.pop(task)
+                conv_in_flight[conv_idx] = False
+                conv_state[conv_idx] = turn_idx + 1  # Mark turn as complete
 
-                # Remove completed task
-                del active_conv_tasks[task]
-
-                # Check if conversation has more turns
-                if conv_state.has_more_turns():
-                    # Schedule next turn from SAME conversation (same user continues)
-                    new_task = asyncio.create_task(
-                        self._process_single_turn_no_semaphore(conv_state)
-                    )
-                    active_conv_tasks[new_task] = conv_state
-                else:
-                    # Conversation fully complete
+                # Check if conversation is fully complete
+                if conv_state[conv_idx] >= max_turns and not conv_complete[conv_idx]:
+                    conv_complete[conv_idx] = True
                     completed_convs += 1
-                    all_completed_convs.append(conv_state)
 
-                    # Replace with a new conversation if available
-                    if pending_convs:
-                        new_conv = pending_convs.pop(0)
-                        new_task = asyncio.create_task(
-                            self._process_single_turn_no_semaphore(new_conv)
-                        )
-                        active_conv_tasks[new_task] = new_conv
-
-                # Ramp-up logic: increase active conversations after batch completes
+                # Ramp-up logic
                 if use_ramp_up and current_concurrency < max_concurrent:
-                    # Ramp up after processing a batch of requests (one full round)
                     requests_since_ramp = completed_requests - requests_at_last_ramp
-
-                    # Trigger ramp-up after current_concurrency requests complete
-                    # (meaning each active conversation completed one request)
                     if requests_since_ramp >= current_concurrency:
                         old_concurrency = current_concurrency
-                        current_concurrency = min(
-                            current_concurrency + ramp_step, max_concurrent
-                        )
-
-                        conversations_to_add = current_concurrency - old_concurrency
+                        current_concurrency = min(current_concurrency + ramp_step, max_concurrent)
                         requests_at_last_ramp = completed_requests
+                        print(f"  Ramping up: {old_concurrency} -> {current_concurrency} concurrent")
 
-                        print(
-                            f"  Ramping up: {old_concurrency} -> {current_concurrency} conversations"
-                        )
+                        # Start additional requests up to new concurrency
+                        while len(active_tasks) < current_concurrency:
+                            next_conv, next_turn = get_next_request()
+                            if next_conv is None:
+                                break
+                            conv_in_flight[next_conv] = True
+                            request = grouped_requests[next_conv][next_turn]
+                            new_task = asyncio.create_task(self._stream_request(request))
+                            active_tasks[new_task] = (next_conv, next_turn)
 
-                        # Start additional conversations
-                        for _ in range(min(conversations_to_add, len(pending_convs))):
-                            new_conv = pending_convs.pop(0)
-                            new_task = asyncio.create_task(
-                                self._process_single_turn_no_semaphore(new_conv)
-                            )
-                            active_conv_tasks[new_task] = new_conv
+                # Start next request if slot available
+                while len(active_tasks) < current_concurrency:
+                    next_conv, next_turn = get_next_request()
+                    if next_conv is None:
+                        break
+                    conv_in_flight[next_conv] = True
+                    request = grouped_requests[next_conv][next_turn]
+                    new_task = asyncio.create_task(self._stream_request(request))
+                    active_tasks[new_task] = (next_conv, next_turn)
 
-        # Collect all results from all conversation states
-        for conv_state in all_completed_convs:
-            self.results.extend(conv_state.results)
+                # Progress reporting
+                if completed_requests % 10 == 0 or completed_requests == total_requests:
+                    elapsed = time.perf_counter() - benchmark_start
+                    print(
+                        f"  Progress: {completed_requests}/{total_requests} requests, "
+                        f"{completed_convs}/{total_convs} conversations done, "
+                        f"{len(active_tasks)}/{current_concurrency} active ({elapsed:.1f}s)"
+                    )
 
         total_time = time.perf_counter() - benchmark_start
         return self._compute_stats(total_time, total_convs)
@@ -707,6 +665,11 @@ class LLMBenchmark:
         )
 
 
+# =============================================================================
+# Output and Reporting
+# =============================================================================
+
+
 def print_stats(stats: LLMBenchmarkStats, args) -> None:
     """Pretty print benchmark statistics."""
     print_header("BENCHMARK RESULTS")
@@ -715,13 +678,14 @@ def print_stats(stats: LLMBenchmarkStats, args) -> None:
     print(f"  URL:              {args.url}")
     print(f"  Model:            {args.model}")
     print(f"  Conversations:    {stats.total_conversations}")
-    print(f"  Total Turns:      {stats.total_requests} (target: {args.total_requests})")
+    print(f"  Total Requests:   {stats.total_requests}")
     print(f"  Max Concurrent:   {args.max_concurrent}")
-    if args.ramp_start > 0 and args.ramp_step > 0:
-        print(
-            f"  Ramp-up:          {args.ramp_start} -> {args.max_concurrent} "
-            f"(step: {args.ramp_step})"
-        )
+    print(f"  Turns/Conv:       {args.max_turns}")
+    
+    ramp_start = getattr(args, 'ramp_start', 0)
+    ramp_step = getattr(args, 'ramp_step', 0)
+    if ramp_start > 0 and ramp_step > 0:
+        print(f"  Ramp-up:          {ramp_start} -> {args.max_concurrent} (step: {ramp_step})")
 
     success_rate = (
         100 * stats.successful_requests / stats.total_requests
@@ -764,7 +728,9 @@ class LLMBenchmarkConfig(BaseModel):
     url: str
     model: str
     max_concurrent: int
-    total_requests_target: int
+    total_requests: int
+    num_conversations: int
+    max_turns: int
     ramp_start: int
     ramp_step: int
     num_warmups: int
@@ -785,7 +751,13 @@ class LLMBenchmarkOutput(BaseModel):
     requests: list[TurnResult]
 
 
-def export_results(stats: LLMBenchmarkStats, benchmark: LLMBenchmark, args) -> str:
+def export_results(
+    stats: LLMBenchmarkStats,
+    benchmark: LLMBenchmark,
+    args,
+    num_conversations: int,
+    total_requests: int,
+) -> str:
     """Export benchmark results to JSON file."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_path = f"benchmark_llm_{args.model}_{timestamp}.json"
@@ -796,9 +768,11 @@ def export_results(stats: LLMBenchmarkStats, benchmark: LLMBenchmark, args) -> s
             url=args.url,
             model=args.model,
             max_concurrent=args.max_concurrent,
-            total_requests_target=args.total_requests,
-            ramp_start=args.ramp_start,
-            ramp_step=args.ramp_step,
+            total_requests=total_requests,
+            num_conversations=num_conversations,
+            max_turns=args.max_turns,
+            ramp_start=getattr(args, 'ramp_start', 0),
+            ramp_step=getattr(args, 'ramp_step', 0),
             num_warmups=args.num_warmups,
             max_tokens=args.max_tokens,
             dataset=args.dataset,
@@ -817,13 +791,45 @@ def export_results(stats: LLMBenchmarkStats, benchmark: LLMBenchmark, args) -> s
     return output_path
 
 
+# =============================================================================
+# Main Entry Point
+# =============================================================================
+
+
 async def run_llm_benchmark(args) -> None:
     """Main entry point for LLM benchmark."""
     random.seed(args.seed)
 
+    # Validate arguments
+    if args.max_turns is None and args.num_conversations is None:
+        raise ValueError(
+            "Either --max-turns or --num-conversations must be specified.\n"
+            "Examples:\n"
+            "  --max-turns 5                    # Use 5 turns per conversation\n"
+            "  --num-conversations 40 --total-requests 200  # Auto-calculate turns (200/40=5)"
+        )
+
+    # Calculate max_turns if not specified
+    if args.max_turns is None:
+        if args.total_requests is None or args.num_conversations is None:
+            raise ValueError(
+                "When --max-turns is not specified, both --total-requests and "
+                "--num-conversations must be provided to calculate turns."
+            )
+        args.max_turns = args.total_requests // args.num_conversations
+        if args.max_turns < 1:
+            raise ValueError(
+                f"Calculated max_turns={args.max_turns} is too low. "
+                f"Increase --total-requests or decrease --num-conversations."
+            )
+        print(f"Auto-calculated --max-turns={args.max_turns} "
+              f"({args.total_requests} requests / {args.num_conversations} conversations)")
+
+    # Load dataset
     df = load_and_prepare_dataset(args.dataset, args.split)
     print(f"Loaded {len(df)} conversations from dataset")
 
+    # Parse conversations
     conversations = []
     for _, row in df.iterrows():
         if "messages" not in row:
@@ -838,39 +844,23 @@ async def run_llm_benchmark(args) -> None:
 
     print(f"Extracted {len(conversations)} valid conversations")
 
-    # Sample conversations to reach target total_requests (hard limit)
-    # Each request = one turn (assistant + users)
-    conv_turns = [(i, count_turns(conv)) for i, conv in enumerate(conversations)]
-
-    random.shuffle(conv_turns)
-    selected_convs = []
-    current_turns = 0
-    target_turns = args.total_requests
-
-    for idx, turns in conv_turns:
-        if current_turns >= target_turns:
-            break
-
-        conv = conversations[idx]
-        turns_needed = target_turns - current_turns
-
-        if turns <= turns_needed:
-            selected_convs.append(conv)
-            current_turns += turns
-        else:
-            truncated = truncate_conversation(conv, turns_needed)
-            if truncated:
-                selected_convs.append(truncated)
-                current_turns += turns_needed
-
-    conversations = selected_convs
-
-    total_turns = sum(count_turns(conv) for conv in conversations)
-    print(
-        f"Selected {len(conversations)} conversations with {total_turns} total turns "
-        f"(target: {target_turns})"
+    # Prepare benchmark requests
+    grouped_requests, num_conversations, total_requests = prepare_benchmark_requests(
+        conversations=conversations,
+        max_turns=args.max_turns,
+        max_concurrent=args.max_concurrent,
+        num_conversations=args.num_conversations,
+        total_requests=args.total_requests,
+        seed=args.seed,
     )
 
+    print(f"\nBenchmark configuration:")
+    print(f"  Conversations: {num_conversations}")
+    print(f"  Turns per conversation: {args.max_turns}")
+    print(f"  Total requests: {total_requests}")
+    print(f"  Max concurrent: {args.max_concurrent}")
+
+    # Create benchmark runner
     benchmark = LLMBenchmark(
         url=args.url,
         model=args.model,
@@ -878,14 +868,17 @@ async def run_llm_benchmark(args) -> None:
         max_tokens=args.max_tokens,
     )
 
-    await benchmark.warmup(conversations, args.num_warmups)
+    # Warmup
+    await benchmark.warmup(grouped_requests, args.num_warmups)
 
+    # Run benchmark
     stats = await benchmark.run_benchmark(
-        conversations=conversations,
+        grouped_requests=grouped_requests,
         max_concurrent=args.max_concurrent,
-        ramp_start=args.ramp_start,
-        ramp_step=args.ramp_step,
+        ramp_start=getattr(args, 'ramp_start', 0),
+        ramp_step=getattr(args, 'ramp_step', 0),
     )
 
+    # Output results
     print_stats(stats, args)
-    export_results(stats, benchmark, args)
+    export_results(stats, benchmark, args, num_conversations, total_requests)

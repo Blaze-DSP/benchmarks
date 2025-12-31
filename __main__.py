@@ -3,8 +3,8 @@
 Common entrypoint for benchmark scripts.
 
 Usage:
-    python -m bechmarks stt --url https://... --model voxtral-mini --endpoint chat
-    python -m bechmarks llm --url https://... --model llama-3.1-8b
+    python -m benchmarks stt --url https://... --model voxtral-mini --endpoint chat
+    python -m benchmarks llm --url https://... --model llama-3.1-8b --max-turns 5
 """
 
 import argparse
@@ -22,13 +22,7 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         "--max-concurrent", type=int, default=10, help="Maximum concurrent requests"
     )
     parser.add_argument(
-        "--total-requests", type=int, default=100, help="Total requests to run"
-    )
-    parser.add_argument(
-        "--ramp-start", type=int, default=0, help="Starting concurrency for ramp-up"
-    )
-    parser.add_argument(
-        "--ramp-step", type=int, default=0, help="Step size for ramp-up"
+        "--total-requests", type=int, default=None, help="Total requests to run (optional, calculated from conversations × turns)"
     )
     parser.add_argument(
         "--num-warmups", type=int, default=5, help="Number of warmup requests"
@@ -54,6 +48,13 @@ def add_stt_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--prompt", type=str, default="Transcribe the given audio in appropriate language.", help="Optional prompt for transcription"
     )
+    # STT still uses the old model - keep ramp-up for compatibility
+    parser.add_argument(
+        "--ramp-start", type=int, default=0, help="Starting concurrency for ramp-up"
+    )
+    parser.add_argument(
+        "--ramp-step", type=int, default=0, help="Step size for ramp-up"
+    )
 
 
 def add_llm_args(parser: argparse.ArgumentParser) -> None:
@@ -61,38 +62,66 @@ def add_llm_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--max-tokens", type=int, default=256, help="Max tokens per response"
     )
+    parser.add_argument(
+        "--max-turns",
+        type=int,
+        default=None,
+        help="Max turns per conversation. All conversations truncated to this value. "
+             "Required if --num-conversations not specified."
+    )
+    parser.add_argument(
+        "--num-conversations",
+        type=int,
+        default=None,
+        help="Number of conversations to use. If specified with --total-requests, "
+             "max-turns is calculated automatically."
+    )
+    parser.add_argument(
+        "--ramp-start",
+        type=int,
+        default=0,
+        help="Starting concurrency for ramp-up (0 = disabled, start at max-concurrent)"
+    )
+    parser.add_argument(
+        "--ramp-step",
+        type=int,
+        default=0,
+        help="Step size for ramp-up (0 = disabled)"
+    )
 
 
 def create_parser() -> argparse.ArgumentParser:
     """Create the main argument parser with subcommands."""
     parser = argparse.ArgumentParser(
-        prog="python -m bechmarks",
+        prog="python -m benchmarks",
         description="Benchmarking suite for vLLM servers",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Benchmark STT with transcriptions endpoint
-  python -m bechmarks stt \\
-      --url https://voxtral-mini.models.example.com/v1 \\
+  # LLM benchmark with 50 conversations, 4 turns each, 20 concurrent
+  python -m benchmarks llm \\
+      --url https://llama.example.com/v1 \\
+      --model llama-3.1-8b \\
+      --dataset HuggingFaceH4/ultrachat_200k \\
+      --max-concurrent 20 \\
+      --num-conversations 50 \\
+      --max-turns 4
+
+  # LLM benchmark with auto-calculated turns (200 requests / 40 convs = 5 turns)
+  python -m benchmarks llm \\
+      --url https://llama.example.com/v1 \\
+      --model llama-3.1-8b \\
+      --dataset HuggingFaceH4/ultrachat_200k \\
+      --max-concurrent 20 \\
+      --total-requests 200 \\
+      --num-conversations 40
+
+  # STT benchmark with transcriptions endpoint
+  python -m benchmarks stt \\
+      --url https://voxtral-mini.example.com/v1 \\
       --model voxtral-mini \\
       --endpoint transcriptions \\
-      --max-concurrent 10 \\
-      --total-requests 100
-
-  # Benchmark STT with chat endpoint (audio input)
-  python -m bechmarks stt \\
-      --url https://qwen3-omni.models.example.com/v1 \\
-      --model qwen3-omni \\
-      --endpoint chat \\
-      --max-concurrent 20 \\
-      --total-requests 100 \\
-      --ramp-start 5 \\
-      --ramp-step 5
-
-  # Benchmark LLM with multi-turn conversations
-  python -m bechmarks llm \\
-      --url https://llama.models.example.com/v1 \\
-      --model llama-3.1-8b \\
+      --dataset your-audio-dataset \\
       --max-concurrent 10 \\
       --total-requests 100
         """,

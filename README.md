@@ -1,16 +1,15 @@
 # Benchmarks
 
-Real-time load testing suite for vLLM inference servers with support for LLM chat completions and audio STT endpoints.
+Load testing suite for vLLM inference servers with support for LLM chat completions and audio STT endpoints.
 
 ## Features
 
-- **Request-level concurrency control**: Maintains exact number of concurrent requests at all times
-- **Dynamic scheduling**: New requests start immediately as previous ones complete
-- **Gradual ramp-up**: Smoothly increase load from starting concurrency to maximum
-- **Multi-turn conversation support**: LLM benchmark processes realistic multi-turn conversations
+- **Guaranteed concurrency**: Semaphore-based control ensures exact concurrent request count
+- **Multi-turn conversations**: LLM benchmark processes realistic multi-turn conversations
+- **Sequential turns, parallel conversations**: Turns within a conversation run sequentially; multiple conversations run in parallel
 - **Streaming metrics**: TTFT (Time to First Token), TPOT (Time Per Output Token), E2E latency
 - **Token throughput**: Input/output tokens per second tracking
-- **vLLM optimized**: Designed to maximize prefix caching and KV cache efficiency
+- **Pre-built requests**: All requests pre-built with deterministic context for reproducibility
 
 ## Installation
 
@@ -18,55 +17,118 @@ Real-time load testing suite for vLLM inference servers with support for LLM cha
 pip install -r requirements.txt
 ```
 
+## Quick Start
+
+### LLM Benchmark - Test 20 Concurrent Requests
+
+```bash
+python -m benchmarks llm \
+  --url https://your-model.example.com/v1 \
+  --model your-model-name \
+  --dataset HuggingFaceH4/ultrachat_200k \
+  --max-concurrent 20 \
+  --num-conversations 40 \
+  --max-turns 5
+```
+
+This runs:
+- 40 conversations × 5 turns = 200 total requests
+- Exactly 20 requests running concurrently at all times
+- Each conversation's turns execute sequentially
+
+## Concurrency Model
+
+### How It Works
+
+```
+Conversation 1:  [Turn 0] → [Turn 1] → [Turn 2] → ...
+Conversation 2:  [Turn 0] → [Turn 1] → [Turn 2] → ...
+Conversation 3:  [Turn 0] → [Turn 1] → [Turn 2] → ...
+...
+                    ↓         ↓         ↓
+              Semaphore limits to N concurrent requests
+```
+
+1. **All conversation chains start simultaneously**
+2. **Semaphore gates execution**: Only `max_concurrent` requests run at once
+3. **Sequential within chains**: A conversation's Turn 1 waits for Turn 0 to complete
+4. **Parallel across chains**: Different conversations execute turns in parallel
+5. **FIFO scheduling**: When a request completes, the next waiting request starts
+
+### Why This Works
+
+- With 40 conversations and `--max-concurrent 20`:
+  - 20 chains acquire semaphore, start Turn 0
+  - 20 chains wait in queue
+  - As Turn 0 completes, that chain releases semaphore and queues for Turn 1
+  - A waiting chain acquires the slot
+
+- **Result**: Exactly 20 requests running at all times until the end tail
+
+### Tail Effect
+
+Concurrency drops only when `remaining_chains < max_concurrent`:
+
+| Conversations | Max Concurrent | Full Concurrency Until |
+|---------------|----------------|------------------------|
+| 40            | 20             | ~80% of requests       |
+| 50            | 20             | ~90% of requests       |
+| 60            | 20             | ~93% of requests       |
+
+**Rule of thumb**: Use `num_conversations >= 1.5 × max_concurrent` for sustained concurrency.
+
 ## Usage
 
 ### LLM Benchmark
 
-Benchmarks `/v1/chat/completions` endpoint with multi-turn conversations.
-
 ```bash
-# Basic usage
+# Specify conversations and turns explicitly
 python -m benchmarks llm \
-  --url https://llama.example.com/v1 \
-  --model llama-3.1-8b \
-  --dataset HuggingFaceH4/ultrachat_200k \
-  --max-concurrent 10 \
-  --total-requests 100
-
-# With ramp-up (start at 5, increase by 5 until reaching 20)
-python -m benchmarks llm \
-  --url https://llama.example.com/v1 \
+  --url https://api.example.com/v1 \
   --model llama-3.1-8b \
   --dataset HuggingFaceH4/ultrachat_200k \
   --max-concurrent 20 \
-  --ramp-start 5 \
-  --ramp-step 5 \
-  --total-requests 200
+  --num-conversations 50 \
+  --max-turns 4
+
+# Auto-calculate turns from total requests
+python -m benchmarks llm \
+  --url https://api.example.com/v1 \
+  --model llama-3.1-8b \
+  --dataset HuggingFaceH4/ultrachat_200k \
+  --max-concurrent 20 \
+  --total-requests 200 \
+  --num-conversations 40
+# → Calculates: 200 / 40 = 5 turns per conversation
+
+# Just specify max turns (uses all valid conversations)
+python -m benchmarks llm \
+  --url https://api.example.com/v1 \
+  --model llama-3.1-8b \
+  --dataset HuggingFaceH4/ultrachat_200k \
+  --max-concurrent 20 \
+  --max-turns 5
 ```
 
 ### STT Benchmark
 
-Benchmarks audio transcription via `/v1/audio/transcriptions` or `/v1/chat/completions` endpoints.
-
 ```bash
 # Transcriptions endpoint
 python -m benchmarks stt \
-  --url https://voxtral-mini.example.com/v1 \
+  --url https://voxtral.example.com/v1 \
   --model voxtral-mini \
   --endpoint transcriptions \
   --dataset your-audio-dataset \
   --max-concurrent 10 \
   --total-requests 100
 
-# Chat endpoint with audio input
+# Chat endpoint with audio
 python -m benchmarks stt \
   --url https://qwen3-omni.example.com/v1 \
   --model qwen3-omni \
   --endpoint chat \
   --dataset your-audio-dataset \
   --max-concurrent 20 \
-  --ramp-start 5 \
-  --ramp-step 5 \
   --total-requests 100
 ```
 
@@ -76,13 +138,11 @@ python -m benchmarks stt \
 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
-| `--url` | str | required | Base URL for the API |
+| `--url` | str | required | Base URL for the API (e.g., `https://api.example.com/v1`) |
 | `--model` | str | required | Model name to use |
 | `--dataset` | str | required | HuggingFace dataset name |
-| `--max-concurrent` | int | 10 | Maximum concurrent requests/conversations |
-| `--total-requests` | int | 100 | Total requests (turns) to run |
-| `--ramp-start` | int | 0 | Starting concurrency for ramp-up (0 = disabled) |
-| `--ramp-step` | int | 0 | Step size for ramp-up (0 = disabled) |
+| `--max-concurrent` | int | 10 | Maximum concurrent requests |
+| `--total-requests` | int | auto | Total requests to run (auto-calculated if not specified) |
 | `--num-warmups` | int | 5 | Number of warmup requests |
 | `--seed` | int | 42 | Random seed for reproducibility |
 | `--split` | str | train | Dataset split to use |
@@ -93,93 +153,216 @@ python -m benchmarks stt \
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
 | `--max-tokens` | int | 256 | Max tokens per response |
+| `--max-turns` | int | required* | Turns per conversation (all truncated to this) |
+| `--num-conversations` | int | auto | Number of conversations to use |
+| `--ramp-start` | int | 0 | Starting concurrency for ramp-up (0 = disabled) |
+| `--ramp-step` | int | 0 | Step size for ramp-up (0 = disabled) |
+
+*Either `--max-turns` or `--num-conversations` with `--total-requests` must be specified.
 
 ### STT-specific Arguments
 
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
 | `--endpoint` | str | required | Endpoint type: `transcriptions` or `chat` |
-| `--prompt` | str | (default prompt) | Prompt for transcription |
+| `--prompt` | str | (default) | Prompt for transcription |
+| `--ramp-start` | int | 0 | Starting concurrency for ramp-up |
+| `--ramp-step` | int | 0 | Step size for ramp-up |
 
-## Concurrency Model
+## Examples
 
-### LLM Benchmark
-- **Concurrency = Number of active conversations** (simulating concurrent users)
-- Each conversation processes turns sequentially
-- New conversations start only when previous ones complete ALL turns
-- Optimizes for vLLM prefix caching (same conversation stays "warm")
+### Load Test: Find Maximum Sustainable Concurrency
 
-### STT Benchmark
-- **Concurrency = Number of active requests**
-- Independent requests with no state dependencies
-- New requests start immediately when previous ones complete
+Test increasing concurrency levels to find the server's limit:
 
-### Ramp-up Behavior
-- Starts with `ramp-start` concurrent requests/conversations
-- After every `current_concurrency` requests complete, increases by `ramp-step`
-- Continues until reaching `max-concurrent`
+```bash
+# Test at 10 concurrent
+python -m benchmarks llm \
+  --url https://api.example.com/v1 \
+  --model llama-3.1-8b \
+  --dataset HuggingFaceH4/ultrachat_200k \
+  --max-concurrent 10 \
+  --num-conversations 20 \
+  --max-turns 10
+
+# Test at 20 concurrent
+python -m benchmarks llm \
+  --url https://api.example.com/v1 \
+  --model llama-3.1-8b \
+  --dataset HuggingFaceH4/ultrachat_200k \
+  --max-concurrent 20 \
+  --num-conversations 40 \
+  --max-turns 10
+
+# Test at 50 concurrent
+python -m benchmarks llm \
+  --url https://api.example.com/v1 \
+  --model llama-3.1-8b \
+  --dataset HuggingFaceH4/ultrachat_200k \
+  --max-concurrent 50 \
+  --num-conversations 100 \
+  --max-turns 10
+```
+
+### Throughput Test: Maximum Requests per Second
+
+High concurrency with short conversations:
+
+```bash
+python -m benchmarks llm \
+  --url https://api.example.com/v1 \
+  --model llama-3.1-8b \
+  --dataset HuggingFaceH4/ultrachat_200k \
+  --max-concurrent 100 \
+  --num-conversations 200 \
+  --max-turns 2 \
+  --max-tokens 50
+```
+
+### Latency Test: Measure Response Times Under Load
+
+Moderate concurrency, many requests for statistical significance:
+
+```bash
+python -m benchmarks llm \
+  --url https://api.example.com/v1 \
+  --model llama-3.1-8b \
+  --dataset HuggingFaceH4/ultrachat_200k \
+  --max-concurrent 10 \
+  --num-conversations 50 \
+  --max-turns 10
+```
+
+### Context Length Test: Long Conversations
+
+Test performance with growing context:
+
+```bash
+python -m benchmarks llm \
+  --url https://api.example.com/v1 \
+  --model llama-3.1-8b \
+  --dataset HuggingFaceH4/ultrachat_200k \
+  --max-concurrent 10 \
+  --num-conversations 20 \
+  --max-turns 20 \
+  --max-tokens 512
+```
+
+### Ramp-Up Test: Gradual Load Increase
+
+Start with low concurrency and gradually increase:
+
+```bash
+python -m benchmarks llm \
+  --url https://api.example.com/v1 \
+  --model llama-3.1-8b \
+  --dataset HuggingFaceH4/ultrachat_200k \
+  --max-concurrent 20 \
+  --num-conversations 40 \
+  --max-turns 5 \
+  --ramp-start 2 \
+  --ramp-step 2
+```
+
+This starts with 2 concurrent requests and increases by 2 after each batch completes (2 → 4 → 6 → ... → 20).
 
 ## Metrics Collected
 
 ### Latency Metrics
-- **E2E Latency**: Total time from request start to completion
-- **TTFT**: Time to First Token (streaming)
-- **TPOT**: Time Per Output Token (generation speed)
+
+| Metric | Description |
+|--------|-------------|
+| **E2E Latency** | Total time from request start to completion |
+| **TTFT** | Time to First Token (streaming) |
+| **TPOT** | Time Per Output Token (excluding first token) |
 
 ### Throughput Metrics
-- **Requests/sec**: Successful requests per second
-- **Input tokens/sec**: Input token throughput
-- **Output tokens/sec**: Output token throughput
+
+| Metric | Description |
+|--------|-------------|
+| **Requests/sec** | Successful requests per second |
+| **Input tok/sec** | Input token throughput |
+| **Output tok/sec** | Output token throughput |
 
 ### Percentile Statistics
+
 All latency metrics include: avg, min, max, p50, p90, p95, p99
 
 ## Output
 
-Results are exported to JSON files with full request details:
-- `benchmark_llm_{model}_{timestamp}.json`
-- `benchmark_stt_{model}_{endpoint}_{timestamp}.json`
+Results are exported to JSON files:
 
----
+```
+benchmark_llm_{model}_{timestamp}.json
+benchmark_stt_{model}_{endpoint}_{timestamp}.json
+```
 
-## Future Improvements
+### JSON Structure
 
-### Load Testing Scenarios
+```json
+{
+  "benchmark_type": "llm",
+  "timestamp": "2024-01-15T10:30:00",
+  "config": {
+    "url": "https://api.example.com/v1",
+    "model": "llama-3.1-8b",
+    "max_concurrent": 20,
+    "total_requests": 200,
+    "num_conversations": 40,
+    "max_turns": 5,
+    "max_tokens": 256
+  },
+  "stats": {
+    "summary": {
+      "total_requests": 200,
+      "successful_requests": 200,
+      "failed_requests": 0,
+      "total_conversations": 40,
+      "total_time_sec": 45.2
+    },
+    "throughput": {
+      "requests_per_sec": 4.42,
+      "output_tokens_per_sec": 1130.5
+    },
+    "latency_ms": {"avg": 450, "p50": 420, "p99": 890},
+    "ttft_ms": {"avg": 85, "p50": 78, "p99": 195},
+    "tpot_ms": {"avg": 12.5, "p50": 11.8, "p99": 25.3}
+  },
+  "requests": [...]
+}
+```
 
-- [ ] **Sustained load testing**: Run at fixed concurrency for a specified duration
-- [ ] **Spike testing**: Sudden increase in load to test server resilience
-- [ ] **Stress testing**: Gradually increase load until failure to find breaking point
-- [ ] **Soak testing**: Extended duration tests to detect memory leaks
-- [ ] **Variable load patterns**: Sinusoidal, step, or custom load curves
+## Troubleshooting
 
-### Additional Benchmark Parameters
+### "No conversations found with >= N turns"
 
-- [ ] **Request rate limiting**: Target specific requests/sec instead of max concurrency
-- [ ] **Think time**: Configurable delay between requests (simulate real user behavior)
-- [ ] **Request timeout**: Configurable timeout with proper error handling
-- [ ] **Retry logic**: Configurable retry attempts for failed requests
-- [ ] **Custom prompts**: Load prompts from file for reproducible testing
+The dataset doesn't have enough multi-turn conversations. Solutions:
+- Lower `--max-turns`
+- Use a different dataset with longer conversations
 
-### Additional Metrics
+### "Need at least N conversations to maintain concurrency"
 
-- [ ] **Latency distribution histograms**: Visual latency distribution
-- [ ] **Time-series metrics**: Track metrics over time during benchmark
-- [ ] **Error categorization**: Detailed breakdown of error types
-- [ ] **Queue depth tracking**: Monitor server-side queue buildup
-- [ ] **GPU utilization**: Integrate with server metrics (if available)
-- [ ] **Cache hit rates**: Track vLLM prefix cache effectiveness
+Not enough conversations after filtering. Solutions:
+- Lower `--max-concurrent`
+- Lower `--max-turns` (more conversations will qualify)
+- Use a larger dataset
 
-### Output Enhancements
+### Warning about sustained concurrency
 
-- [ ] **Real-time dashboard**: Live metrics visualization during benchmark
-- [ ] **HTML reports**: Generate visual benchmark reports
-- [ ] **Comparison mode**: Compare results between runs
-- [ ] **Prometheus metrics**: Export metrics for monitoring systems
-- [ ] **CSV export**: Additional export format for analysis
+The benchmark warns if concurrency may drop before completion:
 
-### Architecture Improvements
+```
+⚠️  Warning: 25 conversations may not sustain 20 concurrency until end.
+   Full concurrency sustained for ~25% of requests.
+   Recommendation: Use >= 30 conversations
+```
 
-- [ ] **Distributed benchmarking**: Run from multiple clients simultaneously
-- [ ] **Plugin system**: Extensible benchmark types
-- [ ] **Configuration files**: YAML/JSON config instead of CLI args
-- [ ] **Async dataset loading**: Stream large datasets without memory issues
+Increase `--num-conversations` or decrease `--max-turns` to fix.
+
+### High failure rate
+
+Check:
+- Server is running and accessible
+- Model name is correct
+- API key is valid (if required)
+- Server can handle the concurrency level
