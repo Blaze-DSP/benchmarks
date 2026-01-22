@@ -147,6 +147,7 @@ python -m benchmarks stt \
 | `--num-warmups` | int | 5 | Number of warmup requests |
 | `--seed` | int | 42 | Random seed for reproducibility |
 | `--shuffle` / `--no-shuffle` | bool | True | Shuffle dataset before sampling (use `--no-shuffle` for deterministic order) |
+| `--save-inputs` | bool | False | Save input payloads (messages/prompts) in per-request results |
 | `--split` | str | train | Dataset split to use |
 | `--api-key` | str | DUMMY | API key for authentication |
 
@@ -332,7 +333,8 @@ benchmark_stt_{model}_{endpoint}_{timestamp}.json
     "max_turns": 5,
     "max_tokens": 256,
     "seed": 42,
-    "shuffle": true
+    "shuffle": true,
+    "save_inputs": false
   },
   "stats": {
     "summary": {

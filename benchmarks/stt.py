@@ -35,6 +35,7 @@ class STTRequestResult(BaseModel):
     error: Optional[str] = None
     transcript: Optional[str] = None
     audio_size_bytes: int = 0
+    prompt: Optional[str] = None
 
 
 def load_and_prepare_dataset(dataset: str, split: str = "validation") -> pd.DataFrame:
@@ -66,7 +67,7 @@ class AudioSTTBenchmark:
         self.results: list[STTRequestResult] = []
 
     async def _request_transcriptions(
-        self, audio_bytes: bytes, request_id: str
+        self, audio_bytes: bytes, request_id: str, save_inputs: bool = False
     ) -> STTRequestResult:
         """Make a streaming request to /v1/audio/transcriptions endpoint."""
         start_time = time.perf_counter()
@@ -134,6 +135,7 @@ class AudioSTTBenchmark:
                 success=True,
                 transcript=collected_text,
                 audio_size_bytes=len(audio_bytes),
+                prompt=self.prompt if save_inputs else None,
             )
 
         except Exception as e:
@@ -147,10 +149,11 @@ class AudioSTTBenchmark:
                 success=False,
                 error=str(e),
                 audio_size_bytes=len(audio_bytes),
+                prompt=self.prompt if save_inputs else None,
             )
 
     async def _request_chat(
-        self, audio_bytes: bytes, request_id: str
+        self, audio_bytes: bytes, request_id: str, save_inputs: bool = False
     ) -> STTRequestResult:
         """Make a streaming request to /v1/chat/completions with audio."""
         start_time = time.perf_counter()
@@ -209,6 +212,7 @@ class AudioSTTBenchmark:
                 output_tokens=output_tokens,
                 transcript=collected_content,
                 audio_size_bytes=len(audio_bytes),
+                prompt=self.prompt if save_inputs else None,
             )
 
         except Exception as e:
@@ -222,16 +226,19 @@ class AudioSTTBenchmark:
                 success=False,
                 error=str(e),
                 audio_size_bytes=len(audio_bytes),
+                prompt=self.prompt if save_inputs else None,
             )
 
     async def _make_request(
-        self, audio_bytes: bytes, request_id: str
+        self, audio_bytes: bytes, request_id: str, save_inputs: bool = False
     ) -> STTRequestResult:
         """Route request to appropriate endpoint handler."""
         if self.endpoint == "transcriptions":
-            return await self._request_transcriptions(audio_bytes, request_id)
+            return await self._request_transcriptions(
+                audio_bytes, request_id, save_inputs
+            )
         elif self.endpoint == "chat":
-            return await self._request_chat(audio_bytes, request_id)
+            return await self._request_chat(audio_bytes, request_id, save_inputs)
         else:
             raise ValueError(f"Unknown endpoint: {self.endpoint}")
 
@@ -264,6 +271,7 @@ class AudioSTTBenchmark:
         ramp_start: int = 0,
         ramp_step: int = 0,
         shuffle: bool = True,
+        save_inputs: bool = False,
     ) -> BenchmarkStats:
         """Run the benchmark with request-level concurrency control.
 
@@ -311,7 +319,9 @@ class AudioSTTBenchmark:
         # Start initial batch of requests
         for _ in range(min(current_concurrency, len(pending_requests))):
             idx, audio, req_id = pending_requests.pop(0)
-            task = asyncio.create_task(self._make_request(audio, req_id))
+            task = asyncio.create_task(
+                self._make_request(audio, req_id, save_inputs=save_inputs)
+            )
             active_tasks[task] = idx
 
         # Process requests as they complete
@@ -340,7 +350,9 @@ class AudioSTTBenchmark:
                 # Start new request if available
                 if pending_requests:
                     idx, audio, req_id = pending_requests.pop(0)
-                    new_task = asyncio.create_task(self._make_request(audio, req_id))
+                    new_task = asyncio.create_task(
+                        self._make_request(audio, req_id, save_inputs=save_inputs)
+                    )
                     active_tasks[new_task] = idx
 
                 # Ramp-up logic: increase concurrency after batch completes
@@ -364,7 +376,9 @@ class AudioSTTBenchmark:
                         for _ in range(min(requests_to_add, len(pending_requests))):
                             idx, audio, req_id = pending_requests.pop(0)
                             new_task = asyncio.create_task(
-                                self._make_request(audio, req_id)
+                                self._make_request(
+                                    audio, req_id, save_inputs=save_inputs
+                                )
                             )
                             active_tasks[new_task] = idx
 
@@ -419,6 +433,7 @@ class STTBenchmarkConfig(BaseModel):
     split: str
     seed: int
     shuffle: bool
+    save_inputs: bool
     api_key: str
 
 
@@ -457,6 +472,7 @@ def export_results(stats: BenchmarkStats, benchmark: AudioSTTBenchmark, args) ->
             split=args.split,
             seed=args.seed,
             shuffle=args.shuffle,
+            save_inputs=args.save_inputs,
             api_key="***" if args.api_key != "DUMMY" else "DUMMY",
         ),
         stats=stats.to_output(),
@@ -509,6 +525,7 @@ async def run_stt_benchmark(args) -> None:
         ramp_start=args.ramp_start,
         ramp_step=args.ramp_step,
         shuffle=args.shuffle,
+        save_inputs=args.save_inputs,
     )
 
     print_stats(stats, args)

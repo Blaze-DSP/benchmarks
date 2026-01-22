@@ -38,6 +38,12 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         help="Shuffle dataset before sampling (default: enabled). Use --no-shuffle for deterministic order.",
     )
     parser.add_argument(
+        "--save-inputs",
+        action="store_true",
+        default=False,
+        help="Save input payloads (messages/prompts) in per-request results",
+    )
+    parser.add_argument(
         "--dataset", type=str, required=True, help="HuggingFace dataset name"
     )
     parser.add_argument(

@@ -59,6 +59,7 @@ class TurnResult(BaseModel):
     output_tokens: int = 0
     error: Optional[str] = None
     response: Optional[str] = None
+    messages: Optional[list[dict]] = None
 
 
 class LLMSummaryStats(BaseModel):
@@ -401,6 +402,7 @@ class LLMBenchmark:
     async def _stream_request(
         self,
         request: PrebuiltRequest,
+        save_inputs: bool = False,
     ) -> TurnResult:
         """Make a streaming request to measure TTFT and collect tokens."""
         start_time = time.perf_counter()
@@ -448,6 +450,7 @@ class LLMBenchmark:
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 response=collected_content,
+                messages=request.messages if save_inputs else None,
             )
 
         except Exception as e:
@@ -462,6 +465,7 @@ class LLMBenchmark:
                 ttft_ms=0,
                 success=False,
                 error=str(e),
+                messages=request.messages if save_inputs else None,
             )
 
     async def warmup(
@@ -491,6 +495,7 @@ class LLMBenchmark:
         max_concurrent: int,
         ramp_start: int = 0,
         ramp_step: int = 0,
+        save_inputs: bool = False,
     ) -> LLMBenchmarkStats:
         """Run the benchmark with round-robin request scheduling.
 
@@ -559,7 +564,9 @@ class LLMBenchmark:
             if conv_idx is not None:
                 conv_in_flight[conv_idx] = True
                 request = grouped_requests[conv_idx][turn_idx]
-                task = asyncio.create_task(self._stream_request(request))
+                task = asyncio.create_task(
+                    self._stream_request(request, save_inputs=save_inputs)
+                )
                 active_tasks[task] = (conv_idx, turn_idx)
 
         # Process requests as they complete
@@ -603,7 +610,7 @@ class LLMBenchmark:
                             conv_in_flight[next_conv] = True
                             request = grouped_requests[next_conv][next_turn]
                             new_task = asyncio.create_task(
-                                self._stream_request(request)
+                                self._stream_request(request, save_inputs=save_inputs)
                             )
                             active_tasks[new_task] = (next_conv, next_turn)
 
@@ -614,7 +621,9 @@ class LLMBenchmark:
                         break
                     conv_in_flight[next_conv] = True
                     request = grouped_requests[next_conv][next_turn]
-                    new_task = asyncio.create_task(self._stream_request(request))
+                    new_task = asyncio.create_task(
+                        self._stream_request(request, save_inputs=save_inputs)
+                    )
                     active_tasks[new_task] = (next_conv, next_turn)
 
                 # Progress reporting
@@ -754,6 +763,7 @@ class LLMBenchmarkConfig(BaseModel):
     split: str
     seed: int
     shuffle: bool
+    save_inputs: bool
     api_key: str
 
 
@@ -795,6 +805,7 @@ def export_results(
             split=args.split,
             seed=args.seed,
             shuffle=args.shuffle,
+            save_inputs=args.save_inputs,
             api_key="***" if args.api_key != "DUMMY" else "DUMMY",
         ),
         stats=stats.to_output(),
@@ -897,6 +908,7 @@ async def run_llm_benchmark(args) -> None:
         max_concurrent=args.max_concurrent,
         ramp_start=getattr(args, "ramp_start", 0),
         ramp_step=getattr(args, "ramp_step", 0),
+        save_inputs=args.save_inputs,
     )
 
     # Output results
