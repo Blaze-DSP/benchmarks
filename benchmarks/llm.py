@@ -277,6 +277,7 @@ def prepare_benchmark_requests(
     num_conversations: Optional[int] = None,
     total_requests: Optional[int] = None,
     seed: int = 42,
+    shuffle: bool = True,
 ) -> tuple[list[list[PrebuiltRequest]], int, int]:
     """Prepare all benchmark requests grouped by conversation.
 
@@ -287,6 +288,7 @@ def prepare_benchmark_requests(
         num_conversations: Target number of conversations (optional)
         total_requests: Target total requests (optional, for validation)
         seed: Random seed for shuffling
+        shuffle: Whether to shuffle conversations before selection
 
     Returns:
         Tuple of (grouped_requests, actual_num_conversations, actual_total_requests)
@@ -311,8 +313,9 @@ def prepare_benchmark_requests(
 
     print(f"Found {len(valid_conversations)} conversations with >= {max_turns} turns")
 
-    # Shuffle for randomness
-    random.shuffle(valid_conversations)
+    # Shuffle for randomness (if enabled)
+    if shuffle:
+        random.shuffle(valid_conversations)
 
     # Determine number of conversations to use
     if num_conversations is not None:
@@ -348,7 +351,11 @@ def prepare_benchmark_requests(
     recommended_convs = int(max_concurrent * 1.5)
     if actual_num_convs < recommended_convs:
         drop_point = (actual_num_convs - max_concurrent) * max_turns
-        sustained_pct = (drop_point / actual_total_requests) * 100 if actual_total_requests > 0 else 0
+        sustained_pct = (
+            (drop_point / actual_total_requests) * 100
+            if actual_total_requests > 0
+            else 0
+        )
         print(
             f"⚠️  Warning: {actual_num_convs} conversations may not sustain "
             f"{max_concurrent} concurrency until end.\n"
@@ -580,9 +587,13 @@ class LLMBenchmark:
                     requests_since_ramp = completed_requests - requests_at_last_ramp
                     if requests_since_ramp >= current_concurrency:
                         old_concurrency = current_concurrency
-                        current_concurrency = min(current_concurrency + ramp_step, max_concurrent)
+                        current_concurrency = min(
+                            current_concurrency + ramp_step, max_concurrent
+                        )
                         requests_at_last_ramp = completed_requests
-                        print(f"  Ramping up: {old_concurrency} -> {current_concurrency} concurrent")
+                        print(
+                            f"  Ramping up: {old_concurrency} -> {current_concurrency} concurrent"
+                        )
 
                         # Start additional requests up to new concurrency
                         while len(active_tasks) < current_concurrency:
@@ -591,7 +602,9 @@ class LLMBenchmark:
                                 break
                             conv_in_flight[next_conv] = True
                             request = grouped_requests[next_conv][next_turn]
-                            new_task = asyncio.create_task(self._stream_request(request))
+                            new_task = asyncio.create_task(
+                                self._stream_request(request)
+                            )
                             active_tasks[new_task] = (next_conv, next_turn)
 
                 # Start next request if slot available
@@ -681,11 +694,13 @@ def print_stats(stats: LLMBenchmarkStats, args) -> None:
     print(f"  Total Requests:   {stats.total_requests}")
     print(f"  Max Concurrent:   {args.max_concurrent}")
     print(f"  Turns/Conv:       {args.max_turns}")
-    
-    ramp_start = getattr(args, 'ramp_start', 0)
-    ramp_step = getattr(args, 'ramp_step', 0)
+
+    ramp_start = getattr(args, "ramp_start", 0)
+    ramp_step = getattr(args, "ramp_step", 0)
     if ramp_start > 0 and ramp_step > 0:
-        print(f"  Ramp-up:          {ramp_start} -> {args.max_concurrent} (step: {ramp_step})")
+        print(
+            f"  Ramp-up:          {ramp_start} -> {args.max_concurrent} (step: {ramp_step})"
+        )
 
     success_rate = (
         100 * stats.successful_requests / stats.total_requests
@@ -738,6 +753,7 @@ class LLMBenchmarkConfig(BaseModel):
     dataset: str
     split: str
     seed: int
+    shuffle: bool
     api_key: str
 
 
@@ -771,13 +787,14 @@ def export_results(
             total_requests=total_requests,
             num_conversations=num_conversations,
             max_turns=args.max_turns,
-            ramp_start=getattr(args, 'ramp_start', 0),
-            ramp_step=getattr(args, 'ramp_step', 0),
+            ramp_start=getattr(args, "ramp_start", 0),
+            ramp_step=getattr(args, "ramp_step", 0),
             num_warmups=args.num_warmups,
             max_tokens=args.max_tokens,
             dataset=args.dataset,
             split=args.split,
             seed=args.seed,
+            shuffle=args.shuffle,
             api_key="***" if args.api_key != "DUMMY" else "DUMMY",
         ),
         stats=stats.to_output(),
@@ -822,8 +839,10 @@ async def run_llm_benchmark(args) -> None:
                 f"Calculated max_turns={args.max_turns} is too low. "
                 f"Increase --total-requests or decrease --num-conversations."
             )
-        print(f"Auto-calculated --max-turns={args.max_turns} "
-              f"({args.total_requests} requests / {args.num_conversations} conversations)")
+        print(
+            f"Auto-calculated --max-turns={args.max_turns} "
+            f"({args.total_requests} requests / {args.num_conversations} conversations)"
+        )
 
     # Load dataset
     df = load_and_prepare_dataset(args.dataset, args.split)
@@ -852,6 +871,7 @@ async def run_llm_benchmark(args) -> None:
         num_conversations=args.num_conversations,
         total_requests=args.total_requests,
         seed=args.seed,
+        shuffle=args.shuffle,
     )
 
     print(f"\nBenchmark configuration:")
@@ -875,8 +895,8 @@ async def run_llm_benchmark(args) -> None:
     stats = await benchmark.run_benchmark(
         grouped_requests=grouped_requests,
         max_concurrent=args.max_concurrent,
-        ramp_start=getattr(args, 'ramp_start', 0),
-        ramp_step=getattr(args, 'ramp_step', 0),
+        ramp_start=getattr(args, "ramp_start", 0),
+        ramp_step=getattr(args, "ramp_step", 0),
     )
 
     # Output results

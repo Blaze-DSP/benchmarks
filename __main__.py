@@ -22,12 +22,21 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
         "--max-concurrent", type=int, default=10, help="Maximum concurrent requests"
     )
     parser.add_argument(
-        "--total-requests", type=int, default=None, help="Total requests to run (optional, calculated from conversations × turns)"
+        "--total-requests",
+        type=int,
+        default=None,
+        help="Total requests to run (optional, calculated from conversations × turns)",
     )
     parser.add_argument(
         "--num-warmups", type=int, default=5, help="Number of warmup requests"
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed for sampling")
+    parser.add_argument(
+        "--shuffle",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Shuffle dataset before sampling (default: enabled). Use --no-shuffle for deterministic order.",
+    )
     parser.add_argument(
         "--dataset", type=str, required=True, help="HuggingFace dataset name"
     )
@@ -46,7 +55,10 @@ def add_stt_args(parser: argparse.ArgumentParser) -> None:
         help="Endpoint type: 'transcriptions' for /v1/audio/transcriptions, 'chat' for /v1/chat/completions",
     )
     parser.add_argument(
-        "--prompt", type=str, default="Transcribe the given audio in appropriate language.", help="Optional prompt for transcription"
+        "--prompt",
+        type=str,
+        default="Transcribe the given audio in appropriate language.",
+        help="Optional prompt for transcription",
     )
     # STT still uses the old model - keep ramp-up for compatibility
     parser.add_argument(
@@ -67,26 +79,23 @@ def add_llm_args(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=None,
         help="Max turns per conversation. All conversations truncated to this value. "
-             "Required if --num-conversations not specified."
+        "Required if --num-conversations not specified.",
     )
     parser.add_argument(
         "--num-conversations",
         type=int,
         default=None,
         help="Number of conversations to use. If specified with --total-requests, "
-             "max-turns is calculated automatically."
+        "max-turns is calculated automatically.",
     )
     parser.add_argument(
         "--ramp-start",
         type=int,
         default=0,
-        help="Starting concurrency for ramp-up (0 = disabled, start at max-concurrent)"
+        help="Starting concurrency for ramp-up (0 = disabled, start at max-concurrent)",
     )
     parser.add_argument(
-        "--ramp-step",
-        type=int,
-        default=0,
-        help="Step size for ramp-up (0 = disabled)"
+        "--ramp-step", type=int, default=0, help="Step size for ramp-up (0 = disabled)"
     )
 
 

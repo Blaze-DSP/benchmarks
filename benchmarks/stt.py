@@ -235,14 +235,19 @@ class AudioSTTBenchmark:
         else:
             raise ValueError(f"Unknown endpoint: {self.endpoint}")
 
-    async def warmup(self, audio_samples: list[bytes], num_warmups: int = 5) -> None:
+    async def warmup(
+        self, audio_samples: list[bytes], num_warmups: int = 5, shuffle: bool = True
+    ) -> None:
         """Run warmup requests (not counted in metrics)."""
         if num_warmups <= 0:
             return
 
         print(f"\nRunning {num_warmups} warmup requests...")
         for i in range(num_warmups):
-            idx = random.randint(0, len(audio_samples) - 1)
+            if shuffle:
+                idx = random.randint(0, len(audio_samples) - 1)
+            else:
+                idx = i % len(audio_samples)
             result = await self._make_request(audio_samples[idx], f"warmup-{i}")
             status = "✓" if result.success else "✗"
             ttft_str = f", ttft: {result.ttft_ms:.0f}ms" if result.ttft_ms > 0 else ""
@@ -258,6 +263,7 @@ class AudioSTTBenchmark:
         max_concurrent: int,
         ramp_start: int = 0,
         ramp_step: int = 0,
+        shuffle: bool = True,
     ) -> BenchmarkStats:
         """Run the benchmark with request-level concurrency control.
 
@@ -269,9 +275,13 @@ class AudioSTTBenchmark:
         benchmark_start = time.perf_counter()
 
         # Pre-generate sample indices for reproducibility
-        sample_indices = [
-            random.randint(0, len(audio_samples) - 1) for _ in range(total_requests)
-        ]
+        if shuffle:
+            sample_indices = [
+                random.randint(0, len(audio_samples) - 1) for _ in range(total_requests)
+            ]
+        else:
+            # Sequential indices (cycling through dataset)
+            sample_indices = [i % len(audio_samples) for i in range(total_requests)]
 
         use_ramp_up = ramp_start > 0 and ramp_step > 0 and ramp_start < max_concurrent
 
@@ -408,6 +418,7 @@ class STTBenchmarkConfig(BaseModel):
     dataset: str
     split: str
     seed: int
+    shuffle: bool
     api_key: str
 
 
@@ -445,6 +456,7 @@ def export_results(stats: BenchmarkStats, benchmark: AudioSTTBenchmark, args) ->
             dataset=args.dataset,
             split=args.split,
             seed=args.seed,
+            shuffle=args.shuffle,
             api_key="***" if args.api_key != "DUMMY" else "DUMMY",
         ),
         stats=stats.to_output(),
@@ -488,7 +500,7 @@ async def run_stt_benchmark(args) -> None:
         prompt=args.prompt,
     )
 
-    await benchmark.warmup(audio_samples, args.num_warmups)
+    await benchmark.warmup(audio_samples, args.num_warmups, shuffle=args.shuffle)
 
     stats = await benchmark.run_benchmark(
         audio_samples=audio_samples,
@@ -496,6 +508,7 @@ async def run_stt_benchmark(args) -> None:
         max_concurrent=args.max_concurrent,
         ramp_start=args.ramp_start,
         ramp_step=args.ramp_step,
+        shuffle=args.shuffle,
     )
 
     print_stats(stats, args)

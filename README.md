@@ -10,6 +10,7 @@ Load testing suite for vLLM inference servers with support for LLM chat completi
 - **Streaming metrics**: TTFT (Time to First Token), TPOT (Time Per Output Token), E2E latency
 - **Token throughput**: Input/output tokens per second tracking
 - **Pre-built requests**: All requests pre-built with deterministic context for reproducibility
+- **Reproducible benchmarks**: Control shuffling with `--shuffle/--no-shuffle` and set `--seed` for deterministic runs
 
 ## Installation
 
@@ -145,6 +146,7 @@ python -m benchmarks stt \
 | `--total-requests` | int | auto | Total requests to run (auto-calculated if not specified) |
 | `--num-warmups` | int | 5 | Number of warmup requests |
 | `--seed` | int | 42 | Random seed for reproducibility |
+| `--shuffle` / `--no-shuffle` | bool | True | Shuffle dataset before sampling (use `--no-shuffle` for deterministic order) |
 | `--split` | str | train | Dataset split to use |
 | `--api-key` | str | DUMMY | API key for authentication |
 
@@ -266,6 +268,24 @@ python -m benchmarks llm \
 
 This starts with 2 concurrent requests and increases by 2 after each batch completes (2 → 4 → 6 → ... → 20).
 
+### Reproducible Test: Deterministic Order
+
+Run benchmarks with deterministic data ordering for reproducible results:
+
+```bash
+python -m benchmarks llm \
+  --url https://api.example.com/v1 \
+  --model llama-3.1-8b \
+  --dataset HuggingFaceH4/ultrachat_200k \
+  --max-concurrent 20 \
+  --num-conversations 40 \
+  --max-turns 5 \
+  --no-shuffle \
+  --seed 42
+```
+
+With `--no-shuffle`, conversations are selected in dataset order. Combined with `--seed`, this ensures the same requests are used across runs.
+
 ## Metrics Collected
 
 ### Latency Metrics
@@ -310,7 +330,9 @@ benchmark_stt_{model}_{endpoint}_{timestamp}.json
     "total_requests": 200,
     "num_conversations": 40,
     "max_turns": 5,
-    "max_tokens": 256
+    "max_tokens": 256,
+    "seed": 42,
+    "shuffle": true
   },
   "stats": {
     "summary": {
